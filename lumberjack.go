@@ -409,7 +409,7 @@ func (l *Logger) millRunOnce() error {
 		if err == nil && errCompress != nil {
 			err = errCompress
 		}
-		if err != nil && l.Uploader.Enabled {
+		if err == nil && l.Uploader.Enabled {
 			go l.upload(nil, fn+compressSuffix)
 		}
 	}
