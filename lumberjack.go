@@ -22,11 +22,18 @@
 package lumberjack
 
 import (
+	"bytes"
 	"compress/gzip"
+	"context"
 	"errors"
 	"fmt"
+	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/clientcredentials"
 	"io"
 	"io/ioutil"
+	"log"
+	"mime/multipart"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -111,12 +118,27 @@ type Logger struct {
 	// leave empty for no header
 	Header string `json:"header" yaml:"header"`
 
+	// Uploader (disabled by default) uploads each rotated file to the given URL using a POST request.
+	// The POST request sends the file as a form-data with the key named `file`.
+	// The uploader supports OAuth2 (disabled by default) by fetching the token
+	// from the provided URL using the given client ID and secret.
+	Uploader UploadConfig `json:"uploader" yaml:"uploader"`
+
 	size int64
 	file *os.File
 	mu   sync.Mutex
 
 	millCh    chan bool
 	startMill sync.Once
+}
+
+type UploadConfig struct {
+	Enabled            bool     `json:"enabled" yaml:"enabled"`
+	URL                string   `json:"url" yaml:"url"`
+	OAuth2TokenURL     string   `json:"oauth2_token_url" yaml:"oauth2_token_url"`
+	OAuth2ClientID     string   `json:"oauth2_client_id" yaml:"oauth2_client_id"`
+	OAuth2ClientSecret string   `json:"oauth2_client_secret" yaml:"oauth2_client_secret"`
+	OAuth2Scopes       []string `json:"oauth2_scopes" yaml:"oauth2_scopes"`
 }
 
 var (
@@ -176,6 +198,9 @@ func (l *Logger) Close() error {
 func (l *Logger) close() error {
 	if l.file == nil {
 		return nil
+	}
+	if !l.Compress && l.Uploader.Enabled {
+		go l.upload(l.file, "")
 	}
 	err := l.file.Close()
 	l.file = nil
@@ -384,6 +409,9 @@ func (l *Logger) millRunOnce() error {
 		if err == nil && errCompress != nil {
 			err = errCompress
 		}
+		if err != nil && l.Uploader.Enabled {
+			go l.upload(nil, fn+compressSuffix)
+		}
 	}
 
 	return err
@@ -477,6 +505,70 @@ func (l *Logger) prefixAndExt() (prefix, ext string) {
 	ext = filepath.Ext(filename)
 	prefix = filename[:len(filename)-len(ext)] + "-"
 	return prefix, ext
+}
+
+// upload takes either an opened file (has precedence) or a path to the file
+func (l *Logger) upload(f *os.File, path string) {
+	var err error
+	if f == nil {
+		f, err = os.Open(path)
+		if err != nil {
+			log.Printf("failed to open log file for upload: %s\n", err)
+			return
+		}
+		defer f.Close()
+	}
+
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+
+	part, err := writer.CreateFormFile("file", f.Name())
+	if err != nil {
+		log.Printf("failed to create form file: %s\n", err)
+		return
+	}
+
+	if _, err = io.Copy(part, f); err != nil {
+		log.Printf("failed to copy file: %s\n", err)
+		return
+	}
+
+	if err = writer.Close(); err != nil {
+		log.Printf("failed to close the multi-part writer: %s\n", err)
+		return
+	}
+
+	req, err := http.NewRequest("POST", l.Uploader.URL, &buf)
+	if err != nil {
+		log.Printf("failed to create the upload request: %s\n", err)
+		return
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+
+	var client *http.Client
+	if len(l.Uploader.OAuth2TokenURL) > 0 {
+		oauth2Config := &clientcredentials.Config{
+			ClientID:     l.Uploader.OAuth2ClientID,
+			ClientSecret: l.Uploader.OAuth2ClientSecret,
+			TokenURL:     l.Uploader.OAuth2TokenURL,
+			Scopes:       l.Uploader.OAuth2Scopes,
+			AuthStyle:    oauth2.AuthStyleInHeader,
+		}
+		client = oauth2Config.Client(context.Background())
+	} else {
+		client = http.DefaultClient
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("failed to send the upload request: %s\n", err)
+		return
+	}
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		log.Printf("upload response http status not OK: %d\n", resp.StatusCode)
+		return
+	}
+	_ = resp.Body.Close()
 }
 
 // compressLogFile compresses the given log file, removing the
